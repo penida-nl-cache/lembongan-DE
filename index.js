@@ -1,4 +1,3 @@
-// cachewarmer_tw_gsheets.js
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { parseStringPromise } from "xml2js";
@@ -6,10 +5,12 @@ import * as dotenv from "dotenv";
 
 dotenv.config();
 
-/* ====== ENV WAJIB (LOG KE GSHEETS) ====== */
+/* ================= ENV ================= */
 const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
+const CLOUDFLARE_ZONE_ID = process.env.CLOUDFLARE_ZONE_ID;
+const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
 
-/* ====== KONFIG DOMAIN / PROXY / UA ====== */
+/* ================= DOMAIN / PROXY / UA ================= */
 const DOMAINS_MAP = {
   de: "https://divinglembongan.de",
 };
@@ -19,49 +20,24 @@ const PROXIES = {
 };
 
 const USER_AGENTS = {
-  de: "DivingLembongan - CacheWarmer - DE / 1.0",
+  de: "DivingLembongan-DE-CacheWarmer/1.0",
 };
 
-/* ====== CLOUDFLARE ====== */
-const CLOUDFLARE_ZONE_ID = process.env.CLOUDFLARE_ZONE_ID;
-const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
-
-/* ====== TARGET EU EDGES ====== */
-const TARGET_EDGES_EU = ["FRA", "AMS", "LHR"];
-const MAX_EDGE_RETRIES = 5;
-
-/* ====== UTIL ====== */
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const cryptoRandomId = () =>
-  Math.random().toString(36).slice(2) + Date.now().toString(36);
+/* ================= UTIL ================= */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function extractCfEdge(cfRay) {
   if (typeof cfRay === "string" && cfRay.includes("-")) {
-    const parts = cfRay.split("-");
-    return parts[parts.length - 1] || "N/A";
+    return cfRay.split("-").pop();
   }
   return "N/A";
 }
 
-/** Nama tab per-run: YYYY-MM-DD_HH-mm-ss_WITA */
-function makeSheetNameForRun(date = new Date()) {
-  const pad = (n) => String(n).padStart(2, "0");
-  const local = new Date(date.getTime() + 8 * 3600 * 1000);
-  return `${local.getUTCFullYear()}-${pad(local.getUTCMonth() + 1)}-${pad(
-    local.getUTCDate()
-  )}_${pad(local.getUTCHours())}-${pad(local.getUTCMinutes())}-${pad(
-    local.getUTCSeconds()
-  )}_WITA`;
-}
-
-/* ====== LOGGER → APPS SCRIPT ====== */
+/* ================= LOGGER → GSHEETS ================= */
 class AppsScriptLogger {
   constructor() {
     this.rows = [];
-    this.runId = cryptoRandomId();
     this.startedAt = new Date().toISOString();
-    this.finishedAt = null;
-    this.sheetName = makeSheetNameForRun();
   }
 
   log({
@@ -74,246 +50,189 @@ class AppsScriptLogger {
     responseMs = "",
     error = 0,
     message = "",
-  } = {}) {
+  }) {
     this.rows.push([
-      this.runId,
       this.startedAt,
-      this.finishedAt,
       country,
       url,
       status,
       cfCache,
       lsCache,
       cfRay,
-      typeof responseMs === "number" ? responseMs : "",
+      responseMs,
       error ? 1 : 0,
       message,
     ]);
   }
 
-  setFinished() {
-    this.finishedAt = new Date().toISOString();
-    this.rows = this.rows.map((r) => ((r[2] = this.finishedAt), r));
-  }
-
   async flush() {
     if (!APPS_SCRIPT_URL || this.rows.length === 0) return;
-
-    try {
-      await axios.post(
-        APPS_SCRIPT_URL,
-        { sheetName: this.sheetName, rows: this.rows },
-        { timeout: 20000, headers: { "Content-Type": "application/json" } }
-      );
-      this.rows = [];
-    } catch (e) {
-      console.warn("Apps Script logging error:", e?.message || e);
-    }
+    await axios.post(
+      APPS_SCRIPT_URL,
+      { rows: this.rows },
+      { headers: { "Content-Type": "application/json" }, timeout: 20000 }
+    );
+    this.rows = [];
   }
 }
 
-/* ====== HTTP HELPER ====== */
-function buildAxiosCfg(country, extra = {}) {
+/* ================= HTTP (EU-ANCHORED) ================= */
+function createEuAgent(country) {
   const proxy = PROXIES[country];
-  const headers = {
-    "User-Agent": USER_AGENTS[country],
-    Accept: "application/xml,text/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
-    ...extra.headers,
-  };
-
-  const cfg = {
-    headers,
-    timeout: 30000,
-    ...extra,
-  };
-
-  if (proxy) {
-    cfg.httpsAgent = new HttpsProxyAgent(proxy);
-  }
-
-  return cfg;
+  if (!proxy) throw new Error(`Missing proxy for ${country}`);
+  return new HttpsProxyAgent(proxy);
 }
 
-async function fetchWithProxy(url, country, timeout = 15000) {
-  const res = await axios.get(url, buildAxiosCfg(country, { timeout }));
+async function fetchWithProxy(url, agent, country, timeout = 15000) {
+  const res = await axios.get(url, {
+    httpsAgent: agent,
+    timeout,
+    headers: {
+      "User-Agent": USER_AGENTS[country],
+      Accept: "application/xml,text/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+    },
+  });
   return res.data;
 }
 
-/* ====== SITEMAP ====== */
-async function fetchRobotsSitemaps(domain, country) {
+/* ================= SITEMAP ================= */
+async function fetchIndexSitemaps(domain, agent, country) {
   try {
-    const txt = await fetchWithProxy(`${domain}/robots.txt`, country, 10000);
-    return String(txt)
-      .split(/\r?\n/)
-      .filter((l) => /^sitemap:\s*/i.test(l))
-      .map((l) => l.split(/:\s*/i)[1].trim())
-      .filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
-async function fetchIndexSitemaps(domain, country) {
-  const candidates = [
-    ...(await fetchRobotsSitemaps(domain, country)),
-    `${domain}/sitemap.xml`,
-    `${domain}/sitemap_index.xml`,
-  ];
-
-  for (const url of [...new Set(candidates)]) {
-    try {
-      const xml = await fetchWithProxy(url, country, 15000);
-      const parsed = await parseStringPromise(xml, {
-        explicitArray: false,
-        ignoreAttrs: true,
-      });
-
-      if (parsed?.sitemapindex?.sitemap) {
-        const list = Array.isArray(parsed.sitemapindex.sitemap)
-          ? parsed.sitemapindex.sitemap
-          : [parsed.sitemapindex.sitemap];
-        const locs = list.map((e) => e.loc).filter(Boolean);
-        if (locs.length) return locs;
-      }
-
-      if (parsed?.urlset?.url) return [url];
-    } catch {}
-  }
-
-  return [];
-}
-
-async function fetchUrlsFromSitemap(sitemapUrl, country) {
-  try {
-    const xml = await fetchWithProxy(sitemapUrl, country, 15000);
+    const xml = await fetchWithProxy(`${domain}/sitemap.xml`, agent, country);
     const parsed = await parseStringPromise(xml, {
       explicitArray: false,
       ignoreAttrs: true,
     });
-    const urls = parsed?.urlset?.url;
-    if (!urls) return [];
-    return (Array.isArray(urls) ? urls : [urls])
-      .map((u) => u.loc)
-      .filter(Boolean);
+
+    const items = parsed?.sitemapindex?.sitemap;
+    if (!items) return [];
+    return (Array.isArray(items) ? items : [items]).map((i) => i.loc);
   } catch {
     return [];
   }
 }
 
-/* ====== CLOUDFLARE PURGE ====== */
-async function purgeCloudflareCache(url) {
-  if (!CLOUDFLARE_ZONE_ID || !CLOUDFLARE_API_TOKEN) return;
-
+async function fetchUrlsFromSitemap(sitemapUrl, agent, country) {
   try {
-    await axios.post(
-      `https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/purge_cache`,
-      { files: [url] },
-      {
-        headers: {
-          Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-  } catch {}
+    const xml = await fetchWithProxy(sitemapUrl, agent, country);
+    const parsed = await parseStringPromise(xml, {
+      explicitArray: false,
+      ignoreAttrs: true,
+    });
+
+    const urls = parsed?.urlset?.url;
+    if (!urls) return [];
+    return (Array.isArray(urls) ? urls : [urls]).map((u) => u.loc);
+  } catch {
+    return [];
+  }
 }
 
-/* ====== WARMER (EU EDGE AWARE) ====== */
-async function warmUrls(urls, country, logger, batchSize = 1, delay = 2000) {
+/* ================= CLOUDFLARE ================= */
+async function purgeCloudflareCache(url) {
+  if (!CLOUDFLARE_ZONE_ID || !CLOUDFLARE_API_TOKEN) return;
+  await axios.post(
+    `https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/purge_cache`,
+    { files: [url] },
+    {
+      headers: {
+        Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+}
+
+/* ================= WARMER (EDGE + ORIGIN) ================= */
+async function warmUrls(urls, agent, country, logger) {
+  const BATCH_SIZE = 3;
+  const DELAY = 7000;
+
   const batches = Array.from(
-    { length: Math.ceil(urls.length / batchSize) },
-    (_, i) => urls.slice(i * batchSize, i * batchSize + batchSize)
+    { length: Math.ceil(urls.length / BATCH_SIZE) },
+    (_, i) => urls.slice(i * BATCH_SIZE, i * BATCH_SIZE + BATCH_SIZE)
   );
 
   for (const batch of batches) {
     await Promise.all(
       batch.map(async (url) => {
         const t0 = Date.now();
+        try {
+          const res = await axios.get(url, {
+            httpsAgent: agent,
+            timeout: 30000,
+            headers: { "User-Agent": USER_AGENTS[country] },
+          });
 
-        for (let attempt = 1; attempt <= MAX_EDGE_RETRIES; attempt++) {
-          try {
-            const res = await axios.get(
-              url,
-              buildAxiosCfg(country, { timeout: 15000 })
-            );
+          const dt = Date.now() - t0;
 
-            const cfCache = res.headers["cf-cache-status"] || "N/A";
-            const lsCache = res.headers["x-litespeed-cache"] || "N/A";
-            const cfRay = res.headers["cf-ray"] || "N/A";
-            const cfEdge = extractCfEdge(cfRay);
-            const dt = Date.now() - t0;
+          /* ===== EDGE (Cloudflare) ===== */
+          const cfCache = res.headers["cf-cache-status"] || "N/A";
+          const cfRay = res.headers["cf-ray"] || "N/A";
+          const edge = extractCfEdge(cfRay);
 
-            console.log(
-              `[${cfEdge}] try=${attempt} cf=${cfCache} ls=${lsCache} ${url}`
-            );
+          /* ===== ORIGIN (LiteSpeed) ===== */
+          const lsCache = res.headers["x-litespeed-cache"] || "N/A";
 
-            if (TARGET_EDGES_EU.includes(cfEdge)) {
-              logger.log({
-                country: cfEdge,
-                url,
-                status: res.status,
-                cfCache,
-                lsCache,
-                cfRay,
-                responseMs: dt,
-                message: `EU edge reached (try ${attempt})`,
-              });
+          console.log(
+            `[${edge}] ${res.status} cf=${cfCache} ls=${lsCache} - ${url}`
+          );
 
-              if (String(lsCache).toLowerCase() !== "hit") {
-                await purgeCloudflareCache(url);
-              }
-              return;
-            }
+          logger.log({
+            country: edge,
+            url,
+            status: res.status,
+            cfCache,
+            lsCache,
+            cfRay,
+            responseMs: dt,
+            error: 0,
+          });
 
-            await sleep(1500);
-          } catch {
-            await sleep(1500);
+          /* ===== EDGE DECISION ===== */
+          if (cfCache !== "HIT") {
+            await purgeCloudflareCache(url);
           }
-        }
 
-        logger.log({
-          country,
-          url,
-          error: 1,
-          message: "EU edge not reached",
-        });
+          /* ===== ORIGIN DECISION (SOFT) ===== */
+          if (String(lsCache).toLowerCase() !== "hit") {
+            await sleep(3000); // soft revalidation, NO edge purge
+          }
+        } catch (e) {
+          logger.log({
+            country,
+            url,
+            error: 1,
+            message: e?.message || "request failed",
+          });
+        }
       })
     );
 
-    await sleep(delay);
+    await sleep(DELAY);
   }
 }
 
-/* ====== MAIN ====== */
+/* ================= MAIN ================= */
 (async () => {
-  console.log("[CacheWarmer] Started");
   const logger = new AppsScriptLogger();
 
   try {
-    await Promise.all(
-      Object.entries(DOMAINS_MAP).map(async ([country, domain]) => {
-        const sitemaps = await fetchIndexSitemaps(domain, country);
-        const urls = (
-          await Promise.all(
-            sitemaps.map((s) => fetchUrlsFromSitemap(s, country))
-          )
+    for (const [country, domain] of Object.entries(DOMAINS_MAP)) {
+      const agent = createEuAgent(country);
+
+      const sitemaps = await fetchIndexSitemaps(domain, agent, country);
+      const urls = (
+        await Promise.all(
+          sitemaps.map((s) => fetchUrlsFromSitemap(s, agent, country))
         )
-          .flat()
-          .filter(Boolean);
+      ).flat();
 
-        logger.log({
-          country,
-          message: `Found ${urls.length} URLs`,
-        });
-
-        await warmUrls(urls, country, logger);
-      })
-    );
+      console.log(`[${country}] Found ${urls.length} URLs`);
+      await warmUrls(urls, agent, country, logger);
+    }
   } finally {
-    logger.setFinished();
     await logger.flush();
   }
-
-  console.log("[CacheWarmer] Finished");
 })();
